@@ -22,7 +22,6 @@ jobs:
           git push origin HEAD:master
 
   docker:
-    needs: version
     runs-on: ubuntu-latest
     steps:
       - name: Set up QEMU
