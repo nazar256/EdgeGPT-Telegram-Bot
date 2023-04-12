@@ -3,7 +3,6 @@
 # Copyright (c) 2023 scmanjarrez. All rights reserved.
 # This work is licensed under the terms of the MIT license.
 
-import asyncio
 
 import json
 import logging
@@ -14,11 +13,10 @@ import traceback
 from pathlib import Path
 from typing import Dict, List, Union
 
-import aiohttp
 import database as db
 
 import edge_tts
-from aiohttp.web import HTTPException
+
 from dateutil.parser import isoparse
 from EdgeGPT import Chatbot
 
@@ -37,10 +35,9 @@ from telegram.ext import ContextTypes
 
 PATH = {}
 DATA = {"config": None, "tts": None, "msg": {}}
-CONV = {}
-LOG_FILT = ["Removed job", "Added job", "Job", "Running job"]
+CONV = {"all": {}, "current": {}}
+LOG_FILT = ["Removed job", "Added job", "Job", "Running job", "message="]
 DEBUG = False
-ASR_API = "https://api.assemblyai.com/v2"
 STATE = {}
 
 
@@ -72,6 +69,7 @@ def rename_files() -> None:
 def set_up() -> None:
     Path(PATH["dir"]).mkdir(exist_ok=True)
     db.setup_db()
+    db.update_db()
     rename_files()
     with open(path("config")) as f:
         DATA["config"] = json.load(f)
@@ -81,15 +79,19 @@ def set_up() -> None:
         pass
 
 
-def settings(key: str) -> str:
+def settings(key: str) -> Union[str, List]:
     return DATA["config"]["settings"][key]
 
 
-def chats(key: str) -> str:
+def apis(key: str) -> str:
+    return DATA["config"]["apis"][key]
+
+
+def chats(key: str) -> Union[str, List]:
     return DATA["config"]["chats"][key]
 
 
-def path(key: str) -> str:
+def path(key: str) -> Path:
     return Path(PATH["dir"]).joinpath(PATH[key])
 
 
@@ -101,13 +103,13 @@ def passwd_correct(passwd: str) -> bool:
     return passwd == DATA["config"]["chats"]["password"]
 
 
-def whitelisted(cid: int) -> bool:
-    return cid in chats("id")
+def whitelisted(_cid: int) -> bool:
+    return _cid in chats("id")
 
 
-def add_whitelisted(cid: int) -> None:
-    if whitelisted(cid) and not db.cached(cid):
-        db.add_user(cid)
+def add_whitelisted(_cid: int) -> None:
+    if whitelisted(_cid) and not db.cached(_cid):
+        db.add_user(_cid)
 
 
 def cid(update: Update) -> int:
@@ -160,9 +162,11 @@ async def list_voices() -> Dict[str, Dict[str, List[str]]]:
 
 
 async def _remove_conversation(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    await CONV[job.chat_id].close()
-    del CONV[job.chat_id]
+    _cid, conv_id = context.job.data
+    _cid = int(_cid)
+    await CONV["all"][_cid][conv_id][0].close()
+    del CONV["all"][_cid][conv_id]
+    CONV["current"][_cid] = ""
 
 
 def delete_job(context: ContextTypes.DEFAULT_TYPE, name: str) -> None:
@@ -178,7 +182,7 @@ def delete_conversation(
     context.job_queue.run_once(
         _remove_conversation,
         isoparse(expiration),
-        chat_id=int(name),
+        data=name.split("_"),
         name=name,
     )
 
@@ -220,11 +224,11 @@ async def edit(
     except BadRequest as br:
         if not str(br).startswith("Message is not modified:"):
             if isinstance(update_message, Update):
-                cid = update_message.effective_message.chat.id
+                _cid = update_message.effective_message.chat.id
             else:
-                update_message.chat.id
+                _cid = update_message.chat.id
             print(
-                f"***  Exception caught in edit ({cid}): ",
+                f"***  Exception caught in edit ({_cid}): ",
                 br,
             )
             traceback.print_stack()
@@ -250,30 +254,48 @@ async def all_minus_tts_keyboard(update: Update) -> None:
     await update.effective_message.edit_reply_markup(markup(new_kb))
 
 
+async def create_conversation(
+    update: Update, chat_id: Union[int, None] = None
+) -> str:
+    if chat_id is None:
+        chat_id = cid(update)
+    try:
+        tmp = Chatbot(cookiePath=str(path("cookies")))
+    except Exception as e:
+        logging.getLogger("EdgeGPT").error(e)
+        await send(update, "EdgeGPT API not available. Try again later.")
+        return ""
+    else:
+        conv_id = tmp.chat_hub.request.conversation_id.split("|")[2][:10]
+        CONV["all"][chat_id][conv_id] = [tmp, ""]
+        CONV["current"][chat_id] = conv_id
+    return conv_id
+
+
 async def is_active_conversation(
     update: Update, new=False, finished=False
 ) -> bool:
     _cid = cid(update)
-    if new or finished or _cid not in CONV:
-        if _cid in CONV:
-            await CONV[_cid].close()
-        try:
-            CONV[_cid] = Chatbot(cookiePath=path("cookies"))
-        except Exception as e:
-            logging.getLogger("EdgeGPT").error(e)
-            await send(update, "EdgeGPT API not available. Try again later.")
+    if _cid not in CONV["all"]:
+        CONV["all"][_cid] = {}
+        CONV["current"][_cid] = ""
+    if new or finished or not CONV["current"][_cid]:
+        if finished:
+            await CONV["all"][_cid][CONV["current"][_cid]][0].close()
+            del CONV["all"][_cid][CONV["current"][_cid]]
+        status = await create_conversation(update)
+        if not status:
             return False
-        else:
-            group = "Reply to any of my messages to interact with me."
-            if new:
-                await send(
-                    update,
-                    (
-                        f"Starting new conversation. "
-                        f"Ask me anything..."
-                        f"{group if is_group(update) else ''}"
-                    ),
-                )
+        group = "Reply to any of my messages to interact with me."
+        if new:
+            await send(
+                update,
+                (
+                    f"Starting new conversation. "
+                    f"Ask me anything..."
+                    f"{group if is_group(update) else ''}"
+                ),
+            )
     return True
 
 
@@ -303,41 +325,3 @@ def generate_link(match: re.Match, references: dict) -> str:
     if text in references:
         link = f"<a href='{references[text]}'>[{text}]</a>"
     return link
-
-
-async def automatic_speech_recognition(data: bytearray) -> str:
-    text = "Could not connect to AssemblyAI API. Try again later."
-    try:
-        async with aiohttp.ClientSession(
-            headers={"authorization": settings("assemblyai_token")}
-        ) as session:
-            async with session.post(f"{ASR_API}/upload", data=data) as req:
-                resp = await req.json()
-                upload = {
-                    "audio_url": resp["upload_url"],
-                    "language_detection": True,
-                }
-            async with session.post(
-                f"{ASR_API}/transcript", json=upload
-            ) as req:
-                resp = await req.json()
-                upload_id = resp["id"]
-                status = resp["status"]
-                while status not in ("completed", "error"):
-                    async with session.get(
-                        f"{ASR_API}/transcript/{upload_id}"
-                    ) as req:
-                        resp = await req.json()
-                        status = resp["status"]
-                        if DEBUG:
-                            logging.getLogger("EdgeGPT-ASR").info(
-                                f"response: {resp}"
-                            )
-                            logging.getLogger("EdgeGPT-ASR").info(
-                                f"{upload_id}: {status}"
-                            )
-                        await asyncio.sleep(5)
-                text = resp["text"]
-    except HTTPException:
-        pass
-    return text
